@@ -1,0 +1,802 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PHPER_VERSION="1.0.0"
+PHPER_DIR="${PHPER_DIR:-$HOME/.phper}"
+
+# --- Helper functions ---
+
+die() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+info() {
+    echo "==> $*"
+}
+
+validate_version() {
+    local ver="$1"
+    if [[ ! "$ver" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+        die "Invalid version format '$ver'. Expected X, X.Y, or X.Y.Z (e.g. 8, 8.4, 8.4.1)"
+    fi
+}
+
+check_build_deps() {
+    local missing=()
+    for cmd in git curl tar make pkg-config autoconf bison re2c; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    # Accept gcc or cc
+    if ! command -v gcc &>/dev/null && ! command -v cc &>/dev/null; then
+        missing+=("gcc")
+    fi
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        die "Missing build dependencies: ${missing[*]}. Run 'install.sh' first or install them manually."
+    fi
+}
+
+fetch_available_versions() {
+    local ver="$1"
+    AVAILABLE_VERSIONS=()
+
+    info "Fetching available PHP $ver versions..."
+    local tags
+    tags=$(git ls-remote --tags https://github.com/php/php-src.git "php-${ver}.*" 2>/dev/null) \
+        || die "Failed to fetch version list from GitHub."
+
+    while IFS= read -r line; do
+        local tag
+        tag=$(echo "$line" | grep -oP 'refs/tags/php-\K[0-9]+\.[0-9]+\.[0-9]+$' || true)
+        if [[ -n "$tag" ]]; then
+            AVAILABLE_VERSIONS+=("$tag")
+        fi
+    done <<< "$tags"
+
+    if [[ ${#AVAILABLE_VERSIONS[@]} -eq 0 ]]; then
+        die "No releases found for PHP $ver. Check that the version branch exists."
+    fi
+
+    # Sort versions
+    mapfile -t AVAILABLE_VERSIONS < <(printf '%s\n' "${AVAILABLE_VERSIONS[@]}" | sort -V)
+}
+
+show_available_versions() {
+    local ver="$1"
+    local latest="${AVAILABLE_VERSIONS[-1]}"
+
+    echo ""
+    echo "Available PHP $ver versions:"
+    echo ""
+
+    local cols=5
+    local count=0
+    for v in "${AVAILABLE_VERSIONS[@]}"; do
+        if [[ "$v" == "$latest" ]]; then
+            printf "  \033[1;32m%-14s\033[0m" "$v (latest)"
+        else
+            printf "  %-14s" "$v"
+        fi
+        count=$((count + 1))
+        if (( count % cols == 0 )); then
+            echo ""
+        fi
+    done
+    if (( count % cols != 0 )); then
+        echo ""
+    fi
+    echo ""
+}
+
+pick_version() {
+    local ver="$1"
+    local auto_yes="$2"
+    local latest="${AVAILABLE_VERSIONS[-1]}"
+
+    show_available_versions "$ver"
+
+    if [[ "$auto_yes" == "yes" ]]; then
+        info "Auto-selecting latest: $latest"
+        PICKED_VERSION="$latest"
+        return
+    fi
+
+    read -rp "Install PHP $latest (latest)? [Y/n/version] " choice
+    choice="${choice:-Y}"
+
+    if [[ "$choice" =~ ^[yY]$ ]]; then
+        PICKED_VERSION="$latest"
+    elif [[ "$choice" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        # Check the chosen version is in the list
+        local found=0
+        for v in "${AVAILABLE_VERSIONS[@]}"; do
+            if [[ "$v" == "$choice" ]]; then
+                found=1
+                break
+            fi
+        done
+        if [[ $found -eq 0 ]]; then
+            die "Version $choice is not available for PHP $ver."
+        fi
+        PICKED_VERSION="$choice"
+    elif [[ "$choice" =~ ^[nN]$ ]]; then
+        echo "Cancelled."
+        exit 0
+    else
+        die "Invalid choice: $choice"
+    fi
+}
+
+resolve_version() {
+    local full_ver="$1"
+    local url="https://www.php.net/releases/index.php?json&version=${full_ver}"
+    local json
+    json=$(curl -sSL "$url") || die "Failed to fetch version info from php.net"
+
+    # Extract the "version" field from JSON
+    FULL_VERSION=$(echo "$json" | grep -oP '"version"\s*:\s*"\K[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [[ -z "$FULL_VERSION" ]]; then
+        die "Could not resolve full version for PHP $full_ver"
+    fi
+
+    # Extract sha256 for the .tar.gz specifically
+    # The JSON lists source entries as: "filename":"php-X.Y.Z.tar.gz", ... "sha256":"<hash>"
+    # We grab the sha256 that follows the .tar.gz filename entry
+    SHA256=$(echo "$json" | grep -oP "php-${FULL_VERSION}\.tar\.gz.*?\"sha256\"\s*:\s*\"\K[0-9a-f]{64}" | head -1)
+    if [[ -z "$SHA256" ]]; then
+        die "Could not extract sha256 checksum for php-${FULL_VERSION}.tar.gz from php.net"
+    fi
+
+    info "Resolved PHP $full_ver → $FULL_VERSION (sha256: ${SHA256:0:12}...)"
+}
+
+download_php() {
+    local full_ver="$1"
+    local url="https://www.php.net/distributions/php-${full_ver}.tar.gz"
+    local tarball="$BUILD_DIR/php-${full_ver}.tar.gz"
+
+    info "Downloading php-${full_ver}.tar.gz..."
+    curl -sSL -o "$tarball" "$url" || die "Failed to download $url"
+
+    info "Verifying checksum..."
+    local actual
+    actual=$(sha256sum "$tarball" | awk '{print $1}')
+    if [[ "$actual" != "$SHA256" ]]; then
+        die "Checksum mismatch! Expected $SHA256, got $actual"
+    fi
+
+    info "Extracting..."
+    tar -xzf "$tarball" -C "$BUILD_DIR"
+
+    # Apply known source patches for specific versions
+    patch_source "$full_ver"
+}
+
+patch_source() {
+    local full_ver="$1"
+    local src_dir="$BUILD_DIR/php-${full_ver}"
+    local ver_int
+    ver_int=$(ver_to_int "$full_ver")
+    local patched=0
+
+    # PHP 8.2.0: zend_atomic.h uses Clang-only __c11_atomic_* builtins on GCC
+    # Fixed in 8.2.1. Patch: use GCC __atomic_*_n builtins instead.
+    if [[ $ver_int -eq 80200 ]]; then
+        local atomic_h="$src_dir/Zend/zend_atomic.h"
+        if [[ -f "$atomic_h" ]] && grep -q '__c11_atomic_store' "$atomic_h"; then
+            sed -i 's/__c11_atomic_store(&obj->value, desired, __ATOMIC_SEQ_CST)/__atomic_store_n(\&obj->value, desired, __ATOMIC_SEQ_CST)/g' "$atomic_h"
+            sed -i 's/__c11_atomic_load(&obj->value, __ATOMIC_SEQ_CST)/__atomic_load_n(\&obj->value, __ATOMIC_SEQ_CST)/g' "$atomic_h"
+            patched=1
+        fi
+    fi
+
+    # PHP 8.1.0-8.1.2: same __c11_atomic issue exists in some early 8.1 releases
+    if [[ $ver_int -ge 80100 && $ver_int -le 80102 ]]; then
+        local atomic_h="$src_dir/Zend/zend_atomic.h"
+        if [[ -f "$atomic_h" ]] && grep -q '__c11_atomic_store' "$atomic_h"; then
+            sed -i 's/__c11_atomic_store(&obj->value, desired, __ATOMIC_SEQ_CST)/__atomic_store_n(\&obj->value, desired, __ATOMIC_SEQ_CST)/g' "$atomic_h"
+            sed -i 's/__c11_atomic_load(&obj->value, __ATOMIC_SEQ_CST)/__atomic_load_n(\&obj->value, __ATOMIC_SEQ_CST)/g' "$atomic_h"
+            patched=1
+        fi
+    fi
+
+    if [[ $patched -eq 1 ]]; then
+        info "Applied source patches for PHP $full_ver"
+    fi
+}
+
+check_openssl_compat() {
+    local ver="$1"
+    local major minor
+    major=$(echo "$ver" | cut -d. -f1)
+    minor=$(echo "$ver" | cut -d. -f2)
+
+    # PHP <= 8.0 cannot compile against OpenSSL 3.0+
+    if [[ $major -lt 8 || ($major -eq 8 && $minor -eq 0) ]]; then
+        local ossl_ver
+        ossl_ver=$(openssl version 2>/dev/null | grep -oP '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [[ -n "$ossl_ver" ]]; then
+            local ossl_major
+            ossl_major=$(echo "$ossl_ver" | cut -d. -f1)
+            if [[ $ossl_major -ge 3 ]]; then
+                echo ""
+                echo "WARNING: PHP $ver cannot compile against OpenSSL $ossl_ver (3.0+)."
+                echo "PHP <= 8.0 requires OpenSSL < 3.0."
+                echo ""
+                echo "Options:"
+                echo "  1. Install OpenSSL 1.1.1 in a separate prefix and set:"
+                echo "     export PKG_CONFIG_PATH=/opt/openssl-1.1.1/lib/pkgconfig"
+                echo "  2. Use PHP 8.1+ which supports OpenSSL 3.0"
+                echo ""
+                OPENSSL_COMPAT=0
+                return
+            fi
+        fi
+    fi
+    OPENSSL_COMPAT=1
+}
+
+# Parse PHP version string (e.g. "7.4.33") into comparable integer (70433)
+ver_to_int() {
+    local v="$1"
+    local major minor patch
+    major=$(echo "$v" | cut -d. -f1)
+    minor=$(echo "$v" | cut -d. -f2)
+    patch=$(echo "$v" | cut -d. -f3)
+    echo $(( major * 10000 + minor * 100 + ${patch:-0} ))
+}
+
+build_php() {
+    local full_ver="$1"
+    local ver="$2"
+    local src_dir="$BUILD_DIR/php-${full_ver}"
+    local prefix="$PHPER_DIR/versions/$ver"
+
+    if [[ ! -d "$src_dir" ]]; then
+        die "Source directory $src_dir not found"
+    fi
+
+    cd "$src_dir"
+
+    # Check OpenSSL compatibility for older PHP
+    check_openssl_compat "$full_ver"
+
+    local configure_help
+    configure_help=$(./configure --help 2>/dev/null || true)
+
+    local flags=(
+        "--prefix=$prefix"
+        "--with-config-file-path=$prefix/etc"
+        "--with-config-file-scan-dir=$prefix/etc/conf.d"
+    )
+
+    local ver_int
+    ver_int=$(ver_to_int "$full_ver")
+
+    # --- Helper to try adding a flag if configure supports it ---
+    local skipped=()
+
+    try_flag() {
+        local flag="$1"
+        local pattern="${2:-$1}"
+        local dep_check="${3:-}"
+        local skip_reason=""
+
+        # Check if configure supports this flag
+        if ! echo "$configure_help" | grep -q -- "$pattern"; then
+            skipped+=("$flag (not supported)")
+            return 0
+        fi
+
+        # Check system dependency if specified
+        if [[ -n "$dep_check" ]]; then
+            local dep_found=0
+            IFS=':' read -ra dep_cmds <<< "$dep_check"
+            for dep_cmd in "${dep_cmds[@]}"; do
+                if eval "$dep_cmd" &>/dev/null; then
+                    dep_found=1
+                    break
+                fi
+            done
+            if [[ $dep_found -eq 0 ]]; then
+                skipped+=("$flag (missing system library)")
+                return 0
+            fi
+        fi
+
+        flags+=("$flag")
+        return 0
+    }
+
+    # ============================================================
+    # Core extensions (all versions)
+    # ============================================================
+    try_flag "--enable-bcmath"
+    try_flag "--enable-sockets"
+    try_flag "--enable-mbstring"
+    try_flag "--with-readline"
+    try_flag "--with-zlib"
+    try_flag "--with-mysqli"
+    try_flag "--with-pdo-mysql"
+
+    # ============================================================
+    # Curl
+    # ============================================================
+    # PHP <= 7.3: --with-curl[=DIR], PHP 7.4+: --with-curl (no DIR)
+    try_flag "--with-curl" "--with-curl" "curl-config:pkg-config --exists libcurl"
+
+    # ============================================================
+    # OpenSSL — skip if incompatible (old PHP + OpenSSL 3.0)
+    # ============================================================
+    if [[ "${OPENSSL_COMPAT:-1}" -eq 1 ]]; then
+        try_flag "--with-openssl"
+    else
+        skipped+=("--with-openssl (OpenSSL 3.0+ incompatible with PHP $full_ver)")
+    fi
+
+    # ============================================================
+    # GD — flags changed completely in PHP 7.4
+    # PHP <= 7.3: --with-gd, --with-jpeg-dir, --with-png-dir, --with-freetype-dir, --with-webp-dir
+    # PHP >= 7.4: --enable-gd, --with-jpeg, --with-webp, --with-freetype
+    # ============================================================
+    if echo "$configure_help" | grep -q -- "--enable-gd"; then
+        # PHP 7.4+ style
+        try_flag "--enable-gd"
+        try_flag "--with-jpeg"
+        try_flag "--with-webp"
+        try_flag "--with-freetype"
+        # --with-avif available in PHP 8.1+
+        try_flag "--with-avif" "--with-avif" "pkg-config --exists libavif"
+    elif echo "$configure_help" | grep -q -- "--with-gd"; then
+        # PHP <= 7.3 style
+        flags+=("--with-gd")
+        # Probe for -dir style flags
+        if echo "$configure_help" | grep -q -- "--with-jpeg-dir"; then
+            flags+=("--with-jpeg-dir=/usr")
+        fi
+        if echo "$configure_help" | grep -q -- "--with-png-dir"; then
+            flags+=("--with-png-dir=/usr")
+        fi
+        if echo "$configure_help" | grep -q -- "--with-freetype-dir"; then
+            flags+=("--with-freetype-dir=/usr")
+        fi
+        if echo "$configure_help" | grep -q -- "--with-webp-dir"; then
+            flags+=("--with-webp-dir=/usr")
+        fi
+    fi
+
+    # ============================================================
+    # Intl (ICU)
+    # PHP <= 7.3: --enable-intl, may need --with-icu-dir=DIR
+    # PHP 7.4+: --enable-intl (pkg-config)
+    # ICU >= 70: changed UBool→bool in BreakIterator (breaks PHP < 8.1)
+    # ICU >= 74: requires C++17 + API changes (breaks PHP < 8.2)
+    # ICU >= 76: changed LocalOpenPointer NTTP (breaks PHP < 8.2)
+    # ============================================================
+    local intl_ok=1
+    local icu_ver
+    icu_ver=$(pkg-config --modversion icu-uc 2>/dev/null || icu-config --version 2>/dev/null || echo "0")
+    local icu_major
+    icu_major=$(echo "$icu_ver" | cut -d. -f1)
+    if [[ "$icu_major" -ge 74 && $ver_int -lt 80200 ]]; then
+        skipped+=("--enable-intl (ICU $icu_ver incompatible with PHP < 8.2)")
+        intl_ok=0
+    elif [[ "$icu_major" -ge 70 && $ver_int -lt 80100 ]]; then
+        skipped+=("--enable-intl (ICU $icu_ver incompatible with PHP < 8.1)")
+        intl_ok=0
+    fi
+    if [[ $intl_ok -eq 1 ]]; then
+        try_flag "--enable-intl" "--enable-intl" "icu-config:pkg-config --exists icu-uc"
+    fi
+
+    # ============================================================
+    # ZIP — changed in PHP 7.4
+    # PHP <= 7.3: --enable-zip [--with-libzip=DIR]
+    # PHP 7.4+: --with-zip (requires system libzip)
+    # ============================================================
+    if echo "$configure_help" | grep -q -- "--with-zip"; then
+        try_flag "--with-zip" "--with-zip" "pkg-config --exists libzip"
+    elif echo "$configure_help" | grep -q -- "--enable-zip"; then
+        flags+=("--enable-zip")
+        # Try adding system libzip if the flag exists
+        if echo "$configure_help" | grep -q -- "--with-libzip"; then
+            try_flag "--with-libzip"
+        fi
+    fi
+
+    # ============================================================
+    # Sodium — added in PHP 7.2
+    # ============================================================
+    try_flag "--with-sodium" "--with-sodium" "pkg-config --exists libsodium"
+
+    # ============================================================
+    # FFI — added in PHP 7.4
+    # ============================================================
+    try_flag "--with-ffi" "--with-ffi" "pkg-config --exists libffi"
+
+    # ============================================================
+    # Argon2 password hashing — added in PHP 7.2
+    # ============================================================
+    try_flag "--with-password-argon2" "--with-password-argon2" "pkg-config --exists libargon2"
+
+    # ============================================================
+    # Soap (uses libxml2, no extra deps)
+    # ============================================================
+    try_flag "--enable-soap"
+
+    # ============================================================
+    # Exif
+    # ============================================================
+    try_flag "--enable-exif"
+
+    # ============================================================
+    # FTP
+    # ============================================================
+    try_flag "--enable-ftp" "--enable-ftp"
+
+    # ============================================================
+    # BZ2
+    # ============================================================
+    try_flag "--with-bz2"
+
+    # ============================================================
+    # libxml — old PHP used --with-libxml-dir, modern uses --with-libxml or implicit
+    # ============================================================
+    if echo "$configure_help" | grep -q -- "--with-libxml-dir"; then
+        flags+=("--with-libxml-dir=/usr")
+    fi
+
+    # ============================================================
+    # PCRE — old PHP had --with-pcre-regex, removed in 7.4
+    # ============================================================
+    # Don't add --with-pcre-regex; bundled PCRE is fine for old versions
+
+    # ============================================================
+    # mcrypt — available in PHP <= 7.1 only
+    # ============================================================
+    if [[ $ver_int -lt 70200 ]]; then
+        try_flag "--with-mcrypt" "--with-mcrypt" "pkg-config --exists libmcrypt"
+    fi
+
+    # ============================================================
+    # mysql ext — available in PHP 5.x only (removed in 7.0)
+    # ============================================================
+    if [[ $ver_int -lt 70000 ]]; then
+        if echo "$configure_help" | grep -q -- "--with-mysql"; then
+            flags+=("--with-mysql=mysqlnd")
+        fi
+    fi
+
+    # ============================================================
+    # Report skipped extensions
+    # ============================================================
+    if [[ ${#skipped[@]} -gt 0 ]]; then
+        echo ""
+        info "Skipping unavailable extensions:"
+        for s in "${skipped[@]}"; do
+            echo "    $s"
+        done
+        echo ""
+    fi
+
+    info "Configuring PHP $full_ver (prefix=$prefix)..."
+    info "Flags: ${flags[*]}"
+    local log_file="$BUILD_DIR/build.log"
+    if ! ./configure "${flags[@]}" >> "$log_file" 2>&1; then
+        echo ""
+        echo "Configure failed. Last 30 lines:"
+        tail -30 "$log_file"
+        die "configure failed for PHP $full_ver. Full log: $log_file"
+    fi
+    tail -3 "$log_file"
+
+    local nproc_val
+    nproc_val="${PHPER_MAKE_JOBS:-$(nproc 2>/dev/null || echo 2)}"
+
+    info "Building with make -j${nproc_val}..."
+    if ! make -j"$nproc_val" >> "$log_file" 2>&1; then
+        echo ""
+        echo "Build failed. Last 30 lines:"
+        tail -30 "$log_file"
+        die "make failed for PHP $full_ver. Full log: $log_file"
+    fi
+    tail -3 "$log_file"
+
+    info "Installing to $prefix..."
+    if ! make install >> "$log_file" 2>&1; then
+        echo ""
+        echo "Install failed. Last 30 lines:"
+        tail -30 "$log_file"
+        die "make install failed for PHP $full_ver. Full log: $log_file"
+    fi
+    tail -3 "$log_file"
+
+    cd /
+}
+
+install_php() {
+    local ver="$1"
+    local auto_yes="${2:-no}"
+    local install_dir="$PHPER_DIR/versions/$ver"
+
+    # Skip if already installed
+    if [[ -x "$install_dir/bin/php" ]]; then
+        info "PHP $ver is already installed at $install_dir/bin/php"
+        "$install_dir/bin/php" -v | head -1
+        return 0
+    fi
+
+    # Handle X.Y.Z (exact version) vs X.Y/X (branch)
+    if [[ "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        # Exact version given — verify it exists
+        local branch
+        branch=$(echo "$ver" | grep -oP '^[0-9]+\.[0-9]+')
+        fetch_available_versions "$branch"
+        local found=0
+        for v in "${AVAILABLE_VERSIONS[@]}"; do
+            if [[ "$v" == "$ver" ]]; then
+                found=1
+                break
+            fi
+        done
+        if [[ $found -eq 0 ]]; then
+            die "PHP $ver does not exist. Run 'phper $branch' to see available versions."
+        fi
+        PICKED_VERSION="$ver"
+        info "Installing PHP $ver"
+    else
+        # Branch given — show picker
+        fetch_available_versions "$ver"
+        pick_version "$ver" "$auto_yes"
+    fi
+
+    # Derive X.Y branch from the picked X.Y.Z version for the install directory
+    ver=$(echo "$PICKED_VERSION" | grep -oP '^[0-9]+\.[0-9]+')
+    install_dir="$PHPER_DIR/versions/$ver"
+
+    # Skip if this X.Y is already installed
+    if [[ -x "$install_dir/bin/php" ]]; then
+        info "PHP $ver is already installed at $install_dir/bin/php"
+        "$install_dir/bin/php" -v | head -1
+        return 0
+    fi
+
+    # Remove stale marker file if it exists (from old versions or failed installs)
+    if [[ -e "$install_dir" && ! -d "$install_dir" ]]; then
+        rm -f "$install_dir"
+    fi
+    mkdir -p "$install_dir"
+
+    check_build_deps
+
+    # Create temp build dir
+    BUILD_DIR=$(mktemp -d)
+    trap 'rm -rf "$BUILD_DIR"' EXIT
+
+    resolve_version "$PICKED_VERSION"
+    download_php "$FULL_VERSION"
+    build_php "$FULL_VERSION" "$ver"
+
+    # Set up php.ini from source tree
+    mkdir -p "$install_dir/etc/conf.d"
+    if [[ -f "$BUILD_DIR/php-${FULL_VERSION}/php.ini-production" ]]; then
+        cp "$BUILD_DIR/php-${FULL_VERSION}/php.ini-production" "$install_dir/etc/php.ini"
+        info "Copied php.ini-production to $install_dir/etc/php.ini"
+    fi
+
+    info "PHP $ver ($FULL_VERSION) installed successfully!"
+    "$install_dir/bin/php" -v | head -1
+
+    # Export resolved version so callers can use it
+    INSTALLED_VER="$ver"
+}
+
+usage() {
+    cat <<'EOF'
+phper — PHP Version Manager
+
+Usage:
+    phper <version> [-y]   Install a PHP version (e.g. phper 8.4 or phper 8.4.1)
+    phper use <version> [-y]  Switch to a PHP version (installs if missing)
+    phper remove <version> Remove an installed PHP version
+    phper ver              Show the currently active PHP version
+    phper --list           List all installed PHP versions
+    phper --version        Show phper version
+    phper --help           Show this help message
+
+EOF
+}
+
+# --- Main ---
+
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+fi
+
+case "$1" in
+    --help|-h)
+        usage
+        ;;
+    --version|-V)
+        echo "phper $PHPER_VERSION"
+        ;;
+    --list)
+        versions_dir="$PHPER_DIR/versions"
+        if [[ ! -d "$versions_dir" ]]; then
+            echo "No PHP versions installed."
+            exit 0
+        fi
+        active=""
+        if [[ -f "$PHPER_DIR/active" ]]; then
+            active=$(cat "$PHPER_DIR/active")
+        fi
+        found=0
+        for ver_dir in "$versions_dir"/*/; do
+            [[ -d "$ver_dir" ]] || continue
+            ver=$(basename "$ver_dir")
+            if [[ -x "$ver_dir/bin/php" ]]; then
+                found=1
+                if [[ "$ver" == "$active" ]]; then
+                    echo "* $ver"
+                else
+                    echo "  $ver"
+                fi
+            fi
+        done
+        if [[ $found -eq 0 ]]; then
+            echo "No PHP versions installed."
+        fi
+        ;;
+    ver)
+        if [[ -f "$PHPER_DIR/active" ]]; then
+            active=$(cat "$PHPER_DIR/active")
+            active_bin="$PHPER_DIR/versions/$active/bin/php"
+            if [[ -x "$active_bin" ]]; then
+                echo "PHP $active"
+                "$active_bin" -v | head -1
+            else
+                echo "PHP $active (set as active but binary not found)"
+            fi
+        elif command -v php &>/dev/null; then
+            php -v | head -1
+        else
+            die "No active PHP version set and no system PHP found."
+        fi
+        ;;
+    remove)
+        if [[ $# -lt 2 ]]; then
+            die "Usage: phper remove <version>"
+        fi
+        ver="$2"
+        validate_version "$ver"
+        install_dir="$PHPER_DIR/versions/$ver"
+
+        # Check if version is installed
+        if [[ ! -d "$install_dir" ]]; then
+            die "PHP $ver is not installed."
+        fi
+
+        # Check if this is the active version
+        is_active=0
+        if [[ -f "$PHPER_DIR/active" ]]; then
+            current=$(cat "$PHPER_DIR/active")
+            if [[ "$current" == "$ver" ]]; then
+                is_active=1
+            fi
+        fi
+
+        # Confirm removal
+        echo "This will remove PHP $ver and all its files from:"
+        echo "  $install_dir"
+        if [[ $is_active -eq 1 ]]; then
+            echo ""
+            echo "WARNING: PHP $ver is currently the active version."
+        fi
+        echo ""
+        read -rp "Are you sure? [y/N] " confirm
+        if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+            echo "Cancelled."
+            exit 0
+        fi
+
+        # Remove the version directory
+        rm -rf "$install_dir"
+        info "Removed $install_dir"
+
+        # If it was active, clean up symlinks and active file
+        if [[ $is_active -eq 1 ]]; then
+            rm -f "$PHPER_DIR/active"
+            for bin in php php-config phpize php-cgi phar; do
+                rm -f "$PHPER_DIR/bin/$bin"
+            done
+            info "Cleared active version (was PHP $ver)."
+            echo "Run 'phper use <version>' to set a new active version."
+        fi
+
+        info "PHP $ver removed successfully."
+        ;;
+    use)
+        if [[ $# -lt 2 ]]; then
+            die "Usage: phper use <version> [-y]"
+        fi
+        ver="$2"
+        validate_version "$ver"
+        auto_yes="no"
+        if [[ "${3:-}" == "-y" ]]; then
+            auto_yes="yes"
+        fi
+
+        # Resolve major-only version (e.g. "8") to X.Y by checking installed versions
+        # or defer to install_php which will resolve it
+        resolved_ver="$ver"
+        install_dir="$PHPER_DIR/versions/$ver"
+
+        # For major-only input, check if we have any X.Y installed under that major
+        if [[ ! "$ver" =~ \. ]]; then
+            # Look for existing installed X.Y under this major
+            latest_installed=""
+            for d in "$PHPER_DIR/versions/${ver}."*/bin/php; do
+                if [[ -x "$d" ]]; then
+                    latest_installed=$(basename "$(dirname "$(dirname "$d")")")
+                fi
+            done
+            if [[ -n "$latest_installed" ]]; then
+                resolved_ver="$latest_installed"
+                install_dir="$PHPER_DIR/versions/$resolved_ver"
+            fi
+        fi
+
+        # Check if already active
+        if [[ -f "$PHPER_DIR/active" ]]; then
+            current=$(cat "$PHPER_DIR/active")
+            if [[ "$current" == "$resolved_ver" && -x "$install_dir/bin/php" ]]; then
+                info "PHP $resolved_ver is already the active version."
+                exit 0
+            fi
+        fi
+
+        # Install if not present
+        if [[ ! -x "$install_dir/bin/php" ]]; then
+            info "PHP $ver is not installed. Installing..."
+            install_php "$ver" "$auto_yes"
+            # install_php resolves the actual X.Y version
+            resolved_ver="$INSTALLED_VER"
+            install_dir="$PHPER_DIR/versions/$resolved_ver"
+        fi
+
+        # Update PATH symlinks in $PHPER_DIR/bin
+        mkdir -p "$PHPER_DIR/bin"
+        for bin in php php-config phpize php-cgi phar; do
+            src="$install_dir/bin/$bin"
+            dest="$PHPER_DIR/bin/$bin"
+            rm -f "$dest"
+            if [[ -x "$src" ]]; then
+                ln -s "$src" "$dest"
+            fi
+        done
+
+        # Record active version
+        echo "$resolved_ver" > "$PHPER_DIR/active"
+        info "Switched to PHP $resolved_ver"
+        "$install_dir/bin/php" -v | head -1
+        if [[ ":$PATH:" != *":$PHPER_DIR/bin:"* ]]; then
+            echo ""
+            echo "Add this to your shell profile to use the managed PHP:"
+            echo "  export PATH=\"$PHPER_DIR/bin:\$PATH\""
+        fi
+        ;;
+    -*)
+        die "Unknown option: $1"
+        ;;
+    *)
+        validate_version "$1"
+        auto_yes="no"
+        if [[ "${2:-}" == "-y" ]]; then
+            auto_yes="yes"
+        fi
+        install_php "$1" "$auto_yes"
+        ;;
+esac

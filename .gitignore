@@ -1,0 +1,10 @@
+test-logs/
+*.log
+.claude/
+
+# Internal dev docs
+idea.md
+php-build.md
+php-build-learn.md
+testing-parallel.md
+deploy.md
